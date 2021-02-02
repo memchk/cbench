@@ -13,4 +13,5 @@ target_include_directories(Vadder PRIVATE ../include)
 verilate(Vadder
         TRACE
         SOURCES rtl/adder.sv
-        INCLUDE_DIRS rtl tb)
+        INCLUDE_DIRS rtl tb
+        VERILATOR_ARGS -O3)

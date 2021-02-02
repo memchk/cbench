@@ -9,39 +9,52 @@
 #include <iostream>
 
 #include "verilated.h"
+#ifdef TRACE_FST
+#include "verilated_fst_c.h"
+#else
 #include "verilated_vcd_c.h"
+#endif
+// Internal Macros
+#define CBENCH_UNCOPYABLE(X) X &operator=(const X &other) = delete; \
+                             X(const X &) = delete;
 
 namespace cbench
-{
-
+{   
     // Private helper functions.
     namespace
-    {   
-        template <typename C, typename Arg, typename... Args>
-        bool scan_args(C comparand, const Arg &arg, const Args &... rest)
+    {
+        template <typename EventNotifier, typename... Args>
+        bool or_notifier(EventNotifier &&arg, Args&&... rest)
         {
             if constexpr (sizeof...(rest) > 0)
             {
-                return (arg == comparand) || scan_args(rest..., comparand);
+                return std::forward<EventNotifier>(arg)() || or_notifier(std::forward<Args>(rest)...);
             }
             else
             {
-                return arg == comparand;
+                return std::forward<EventNotifier>(arg)();
             }
         }
     } // namespace
 
-    class Clock
+    class Peripherial
     {
-
-        template<typename Friend>
+        template <typename Friend>
         friend class TestBench;
+
+    private:
+        virtual vluint64_t time_to_event() const = 0;
+        virtual bool advance(vluint64_t delta_time) = 0;
+    };
+
+    class Clock final : public Peripherial
+    {
 
         CData &clk_;
         vluint64_t increment_, now_, last_cycle_;
         vluint64_t ticks_;
 
-        bool advance(vluint64_t delta_time)
+        bool advance(vluint64_t delta_time) override
         {
             // Throw if this would cause a clock to skip.
             assert(delta_time <= increment_);
@@ -70,18 +83,7 @@ namespace cbench
             }
         }
 
-    public:
-        Clock(CData &clk, vluint64_t interval, vluint64_t offset) : clk_(clk), increment_(interval / 2), last_cycle_(0), ticks_(0), now_(offset)
-        {
-            // Start the clock on logic low.
-            clk_ = 0;
-        };
-
-        // Do not allow copying of clocks.
-        Clock &operator=(const Clock &other) = delete;
-        Clock(const Clock &) = delete;
-
-        vluint64_t time_to_edge() const
+        vluint64_t time_to_event() const override
         {
             assert(last_cycle_ <= now_);
 
@@ -90,10 +92,12 @@ namespace cbench
                 // next cycle is a falling edge.
                 return (last_cycle_ + increment_) - now_;
             }
-
-            // if (now_ < last_cycle_ + 2*increment_)
             return (last_cycle_ + 2 * increment_) - now_;
         }
+
+    public:
+        Clock(CData &clk, vluint64_t interval, vluint64_t offset) : clk_(clk), increment_(interval / 2), now_(offset), last_cycle_(0), ticks_(0) {}
+        CBENCH_UNCOPYABLE(Clock);
 
         bool rising_edge() const
         {
@@ -105,16 +109,32 @@ namespace cbench
             return now_ == last_cycle_ + increment_;
         }
 
-        vluint64_t ticks() const
-        {
-            return ticks_;
+        auto rising_edges(vluint64_t n) const
+        {      
+            auto goal = last_cycle_ + (2* n * increment_);
+            return [this, goal]() {
+                return now_ >= goal;
+            };
         }
+
+        auto falling_edges(vluint64_t n) const
+        {
+            auto goal = last_cycle_ + increment_ + (2* n * increment_);
+            return [this, goal]() {
+                return now_ >= goal;
+            };
+        }
+    };
+
+    class SPIMaster final : public Peripherial
+    {
+        CData &sclk_, &miso_, &mosi_, &cs_;
     };
 
     template <typename M>
     class TestBench final
     {
-        std::vector<std::unique_ptr<Clock>> clocks_;
+        std::vector<Peripherial *> peripherials_;
         std::unique_ptr<VerilatedVcdC> trace_;
         vluint64_t global_time_;
         std::unique_ptr<M> core;
@@ -123,25 +143,22 @@ namespace cbench
         TestBench() : core(std::make_unique<M>()), global_time_(0) {}
 
         // Do not allow copying of TestBench.
-        TestBench &operator=(const TestBench &other) = delete;
-        TestBench(const TestBench &) = delete;
+        CBENCH_UNCOPYABLE(TestBench);
 
-        Clock &assign_clock(CData &clk, vluint64_t interval, vluint64_t offset = 0)
+        template<typename P>
+        void attach(P &p)
         {
-            // Force clocks to be at least 4 time quanta big, prevents issues with trace dumping.
-            assert(interval >= 4);
-
-            clocks_.push_back(std::make_unique<Clock>(clk, interval, offset));
-            return *clocks_.back();
+            peripherials_.push_back(&p);
         }
 
         void advance()
-        {
-            auto min_time = (*std::min_element(clocks_.begin(), clocks_.end(), [](auto &a, auto &b) { return a->time_to_edge() < b->time_to_edge(); }))->time_to_edge();
+        {   
+            // Find the minimum time between any registered periperials to advance time.
+            auto min_time = (*std::min_element(peripherials_.begin(), peripherials_.end(), [](auto &a, auto &b) { return a->time_to_event() < b->time_to_event(); }))->time_to_event();
 
             // Time must advance at least 1 simulation quanta.
-            assert(min_time > 0);
-
+            assert(min_time > 0);;
+            std::cout << "MT: " << min_time << std::endl;
             core->eval();
 
             if (trace_)
@@ -150,9 +167,9 @@ namespace cbench
                 trace_->dump(global_time_ + 1);
             }
 
-            for (auto &clock : clocks_)
+            for (auto &p : peripherials_)
             {
-                clock->advance(min_time);
+                p->advance(min_time);
             }
 
             global_time_ += min_time;
@@ -162,17 +179,6 @@ namespace cbench
             {
                 trace_->dump(global_time_);
             }
-        }
-
-        void advance(const Clock &pace_clk, vluint64_t ticks)
-        {
-            auto current_ticks = pace_clk.ticks();
-            while (pace_clk.ticks() < (current_ticks + ticks))
-            {
-                advance();
-            }
-
-            assert(pace_clk.rising_edge());
         }
 
         void open_trace(const std::string &filename, int depth = 99)
@@ -197,18 +203,6 @@ namespace cbench
             }
         }
 
-        template <typename C, typename... Args>
-        void wait_for(const Clock &clk, C comparand, const Args &... rest)
-        {
-            do
-            {
-                do
-                {
-                    advance();
-                } while (!clk.rising_edge());
-            } while (!scan_args(comparand, rest...));
-        }
-
         M *operator->()
         {
             return core.get();
@@ -222,5 +216,57 @@ namespace cbench
             }
         }
     };
+
+    template<typename M, typename EventNotifier>
+    TestBench<M>& operator>>(TestBench<M> &tb, EventNotifier notif)
+    {
+        while(!notif())
+        {
+            tb.advance();
+        }
+
+        return tb;
+    }
+
+
+    template <typename... Args>
+    auto any(Args&&... rest)
+    {   
+        return [&]()
+        {
+            return or_notifier(std::forward<Args>(rest)...);
+        };
+    }
+
+    template <typename Pin>
+    auto value(Pin &pin, Pin value)
+    {
+        return [&]()
+        {
+            return pin == value;
+        };
+    }
+
+    template <typename Pin>
+    auto high(Pin &pin)
+    {
+        return [&]()
+        {
+            return pin > 0;
+        };
+    }
+
+    template <typename Pin>
+    auto low(Pin &pin)
+    {
+        return [&]()
+        {
+            return pin == 0;
+        };
+    }
+
 } // namespace cbench
+
+
+#undef CBENCH_UNCOPYABLE
 #endif
